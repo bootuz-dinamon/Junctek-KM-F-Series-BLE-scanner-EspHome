@@ -1,0 +1,262 @@
+substitutions:
+  name: "junctek-km140f"
+  friendly_name: "Junctek KM140F"
+  # MAC-адреса Bluetooth модуля монітора (формат BTGxxx).
+  # Знайти можна через ESPHome BLE tracker лог, або через nRF Connect /
+  # LightBlue на телефоні — шукай пристрій з назвою BTGxxx.
+  mac_address: "48:31:B7:5A:B0:0A"
+  # Ємність батареї в Ah — потрібна тільки для обчислення SoC%,
+  # якщо сам монітор не передає відсоток напряму.
+  battery_capacity_ah: "100"
+  poll_interval: "5s"
+
+esphome:
+  name: kmfjunktec
+  friendly_name: KMFjunktec
+
+esp32:
+  board: esp32dev
+  framework:
+    type: arduino
+
+
+# Enable logging
+logger:
+  level: DEBUG
+  logs:
+    esp32_ble_client: DEBUG
+    esp32_ble: DEBUG
+    esp32_ble_tracker: DEBUG
+    component: ERROR   # прибираємо шум про "took a long time"
+
+# Enable Home Assistant API
+api:
+  encryption:
+    key: "YOUR_KEY____________________"
+
+ota:
+  - platform: esphome
+    password: "YOUR_KEY____________________"
+
+wifi:
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
+
+  # Enable fallback hotspot (captive portal) in case wifi connection fails
+  ap:
+    ssid: "Kmfjunktec Fallback Hotspot"
+    password: "ehPwkMs89pMf"
+
+captive_portal:
+    
+
+################################################################################
+# BLE
+################################################################################
+
+esp32_ble_tracker:
+ 
+ble_client:
+  - mac_address: ${mac_address}
+    id: km140f_ble
+ 
+# Глобальний буфер для накопичення байтів текстової відповіді,
+# доки не прийде символ кінця рядка.
+globals:
+  - id: ble_buffer
+    type: std::string
+    restore_value: false
+ 
+sensor:
+  # --- слухаємо notify-потік монітора (текстові рядки) ---
+  - platform: ble_client
+    type: characteristic
+    ble_client_id: km140f_ble
+    id: km140f_raw
+    internal: true
+    service_uuid: "4fafc201-1fb5-459e-8fcc-c5c9c331914b"
+    characteristic_uuid: "beb5483e-36e1-4688-b7f5-ea07361b26a8"
+    notify: true
+    lambda: |-
+      // накопичуємо байти у буфер, поки не зустрінемо кінець рядка
+      for (uint8_t b : x) {
+        if (b == '\n' || b == '\r') {
+          if (!id(ble_buffer).empty()) {
+            std::string line = id(ble_buffer);
+            id(ble_buffer).clear();
+ 
+            // ДІАГНОСТИКА: монітор сам пасивно шле три типи рядків:
+            //   :A=... :B=... :C=...
+            // кожен з 9 полів. Поки що логуємо ВСІ поля кожного типу,
+            // щоб зіставити з показниками на дисплеї монітора і знайти,
+            // де саме напруга/струм/Ah/температура/час.
+            ESP_LOGI("junctek", "RAW LINE: '%s'", line.c_str());
+ 
+            std::string prefix;  // "A", "B" або "C"
+            size_t eq = std::string::npos;
+ 
+            if ((eq = line.find("A=")) != std::string::npos) {
+              prefix = "A";
+            } else if ((eq = line.find("B=")) != std::string::npos) {
+              prefix = "B";
+            } else if ((eq = line.find("C=")) != std::string::npos) {
+              prefix = "C";
+            }
+ 
+            if (!prefix.empty()) {
+              std::string csv = line.substr(eq + 2);
+              std::vector<std::string> fields;
+              size_t pos = 0;
+              while (pos < csv.size()) {
+                size_t comma = csv.find(',', pos);
+                if (comma == std::string::npos) comma = csv.size();
+                fields.push_back(csv.substr(pos, comma - pos));
+                pos = comma + 1;
+              }
+ 
+              ESP_LOGI("junctek", "Type %s: %d fields", prefix.c_str(), (int) fields.size());
+              for (size_t fi = 0; fi < fields.size(); fi++) {
+                ESP_LOGI("junctek", "  %s[%d] = '%s'", prefix.c_str(), (int) fi, fields[fi].c_str());
+              }
+ 
+              auto get_long = [&](size_t idx) -> long {
+                if (idx < fields.size() && !fields[idx].empty()) {
+                  return strtol(fields[idx].c_str(), nullptr, 10);
+                }
+                return 0;
+              };
+ 
+              // ПІДТВЕРДЖЕНО користувачем (звірка з реальним навантаженням
+              // ~3А і з налаштуваннями монітора):
+              //   A[0] = напруга, *0.01 В
+              //   A[1] = струм, *0.001 А (3020 -> 3.02А під навантаженням)
+              //   A[3] = час до розряду/заряду, хвилини (39 — підтверджено
+              //          розрахунком Ah/струм*60, збігається з точністю
+              //          до округлення)
+              //   A[4] = залишок ємності, *0.001 Ah (1973 -> 1.973Ah,
+              //          зменшується під час розряду — це НЕ SoC%,
+              //          попередня гіпотеза про SoC була помилковою,
+              //          бо відсоток не може перевищувати 100)
+              //   A[5] = встановлена ємність батареї, *0.1 Ah (100 -> 10.0Ah)
+              //   A[6] = яскравість дисплея (не чіпаємо, не публікуємо)
+              //   A[8] = налаштування пристрою (не чіпаємо, не публікуємо)
+              // ЩЕ НЕ З'ЯСОВАНО:
+              //   A[2] = завжди 0 у наших прикладах — можливо напрям
+              //          струму (0=розряд/1=заряд) або потужність,
+              //          яку поки не бачили відмінною від нуля
+              //   A[7] = стала константа (150500 у всіх відомих прикладах)
+              if (prefix == "A" && fields.size() >= 6) {
+                float voltage = get_long(0) / 100.0f;
+                float current = get_long(1) / 1000.0f;
+                long minutes_remaining = get_long(3);
+                float ah_remaining = get_long(4) / 1000.0f;
+                float capacity_setting = get_long(5) / 10.0f;
+                float power = voltage * current;
+ 
+                id(voltage_sensor).publish_state(voltage);
+                id(current_sensor).publish_state(current);
+                id(power_sensor).publish_state(power);
+                id(minutes_remaining_sensor).publish_state((float) minutes_remaining);
+                id(ah_remaining_sensor).publish_state(ah_remaining);
+                id(capacity_setting_sensor).publish_state(capacity_setting);
+ 
+                if (capacity_setting > 0) {
+                  float soc = ah_remaining / capacity_setting * 100.0f;
+                  if (soc > 100) soc = 100;
+                  if (soc < 0) soc = 0;
+                  id(soc_sensor).publish_state(soc);
+                }
+              }
+            }
+          }
+        } else {
+          id(ble_buffer) += (char) b;
+          // запобіжник від переповнення, якщо щось пішло не так
+          if (id(ble_buffer).size() > 200) {
+            id(ble_buffer).clear();
+          }
+        }
+      }
+      return {};
+ 
+  - platform: template
+    name: "${friendly_name} Напруга"
+    id: voltage_sensor
+    unit_of_measurement: "V"
+    device_class: voltage
+    state_class: measurement
+    accuracy_decimals: 2
+    update_interval: never
+ 
+  - platform: template
+    name: "${friendly_name} Струм"
+    id: current_sensor
+    unit_of_measurement: "A"
+    device_class: current
+    state_class: measurement
+    accuracy_decimals: 2
+    update_interval: never
+ 
+  - platform: template
+    name: "${friendly_name} Потужність"
+    id: power_sensor
+    unit_of_measurement: "W"
+    device_class: power
+    state_class: measurement
+    accuracy_decimals: 2
+    update_interval: never
+ 
+  - platform: template
+    name: "${friendly_name} Залишок ємності"
+    id: ah_remaining_sensor
+    unit_of_measurement: "Ah"
+    state_class: measurement
+    accuracy_decimals: 3
+    icon: "mdi:battery-charging"
+    update_interval: never
+ 
+  - platform: template
+    name: "${friendly_name} Час до розряду/заряду"
+    id: minutes_remaining_sensor
+    unit_of_measurement: "min"
+    icon: "mdi:timer-sand"
+    state_class: measurement
+    accuracy_decimals: 0
+    update_interval: never
+ 
+  - platform: template
+    name: "${friendly_name} Встановлена ємність батареї"
+    id: capacity_setting_sensor
+    unit_of_measurement: "Ah"
+    state_class: measurement
+    accuracy_decimals: 1
+    icon: "mdi:battery-charging-100"
+    update_interval: never
+ 
+  - platform: template
+    name: "${friendly_name} Заряд (SoC)"
+    id: soc_sensor
+    unit_of_measurement: "%"
+    device_class: battery
+    state_class: measurement
+    accuracy_decimals: 1
+    update_interval: never
+ 
+  # RSSI BLE-з'єднання — корисно для діагностики дальності/стабільності
+  - platform: ble_client
+    type: rssi
+    ble_client_id: km140f_ble
+    name: "${friendly_name} RSSI"
+    entity_category: diagnostic
+ 
+binary_sensor:
+  - platform: template
+    name: "${friendly_name} Заряджається"
+    id: charging_status
+    device_class: battery_charging
+ 
+# ПРИМІТКА: жодна команда запиту не потрібна — KM140F сам пасивно
+# (без запиту) шле через notify три типи рядків кожні кілька секунд:
+#   :A=... :B=... :C=...
+# Раніше тут була команда :R50= для KG/KH-серії, але KM140F використовує
+# інший, простіший протокол push-розсилки.
