@@ -50,25 +50,24 @@ wifi:
 captive_portal:
     
 
-################################################################################
+###############################################################################
 # BLE
 ################################################################################
-
+ 
 esp32_ble_tracker:
  
 ble_client:
   - mac_address: ${mac_address}
     id: km140f_ble
  
-# Глобальний буфер для накопичення байтів текстової відповіді,
-# доки не прийде символ кінця рядка.
+# Text line accumulation buffer — collects incoming bytes until \r or \n.
 globals:
   - id: ble_buffer
     type: std::string
     restore_value: false
  
 sensor:
-  # --- слухаємо notify-потік монітора (текстові рядки) ---
+  # Raw BLE characteristic listener — all parsing happens in the lambda below.
   - platform: ble_client
     type: characteristic
     ble_client_id: km140f_ble
@@ -78,32 +77,21 @@ sensor:
     characteristic_uuid: "beb5483e-36e1-4688-b7f5-ea07361b26a8"
     notify: true
     lambda: |-
-      // накопичуємо байти у буфер, поки не зустрінемо кінець рядка
+      // Accumulate bytes until end-of-line, then parse the complete line.
       for (uint8_t b : x) {
         if (b == '\n' || b == '\r') {
           if (!id(ble_buffer).empty()) {
             std::string line = id(ble_buffer);
             id(ble_buffer).clear();
  
-            // ДІАГНОСТИКА: монітор сам пасивно шле три типи рядків:
-            //   :A=... :B=... :C=...
-            // кожен з 9 полів. Поки що логуємо ВСІ поля кожного типу,
-            // щоб зіставити з показниками на дисплеї монітора і знайти,
-            // де саме напруга/струм/Ah/температура/час.
-            ESP_LOGI("junctek", "RAW LINE: '%s'", line.c_str());
- 
-            std::string prefix;  // "A", "B" або "C"
+            // Detect line type: :A=, :C=
+            std::string prefix;
             size_t eq = std::string::npos;
- 
-            if ((eq = line.find("A=")) != std::string::npos) {
-              prefix = "A";
-            } else if ((eq = line.find("B=")) != std::string::npos) {
-              prefix = "B";
-            } else if ((eq = line.find("C=")) != std::string::npos) {
-              prefix = "C";
-            }
+            if      ((eq = line.find("A=")) != std::string::npos) { prefix = "A"; }
+            else if ((eq = line.find("C=")) != std::string::npos) { prefix = "C"; }
  
             if (!prefix.empty()) {
+              // Split CSV payload into fields vector.
               std::string csv = line.substr(eq + 2);
               std::vector<std::string> fields;
               size_t pos = 0;
@@ -114,67 +102,55 @@ sensor:
                 pos = comma + 1;
               }
  
-              ESP_LOGI("junctek", "Type %s: %d fields", prefix.c_str(), (int) fields.size());
-              for (size_t fi = 0; fi < fields.size(); fi++) {
-                ESP_LOGI("junctek", "  %s[%d] = '%s'", prefix.c_str(), (int) fi, fields[fi].c_str());
-              }
- 
               auto get_long = [&](size_t idx) -> long {
-                if (idx < fields.size() && !fields[idx].empty()) {
+                if (idx < fields.size() && !fields[idx].empty())
                   return strtol(fields[idx].c_str(), nullptr, 10);
-                }
                 return 0;
               };
  
-              // ПІДТВЕРДЖЕНО користувачем (звірка з реальним навантаженням
-              // ~3А і з налаштуваннями монітора):
-              //   A[0] = напруга, *0.01 В
-              //   A[1] = струм, *0.001 А (3020 -> 3.02А під навантаженням)
-              //   A[3] = час до розряду/заряду, хвилини (39 — підтверджено
-              //          розрахунком Ah/струм*60, збігається з точністю
-              //          до округлення)
-              //   A[4] = залишок ємності, *0.001 Ah (1973 -> 1.973Ah,
-              //          зменшується під час розряду — це НЕ SoC%,
-              //          попередня гіпотеза про SoC була помилковою,
-              //          бо відсоток не може перевищувати 100)
-              //   A[5] = встановлена ємність батареї, *0.1 Ah (100 -> 10.0Ah)
-              //   A[6] = яскравість дисплея (не чіпаємо, не публікуємо)
-              //   A[8] = налаштування пристрою (не чіпаємо, не публікуємо)
-              // ЩЕ НЕ З'ЯСОВАНО:
-              //   A[2] = завжди 0 у наших прикладах — можливо напрям
-              //          струму (0=розряд/1=заряд) або потужність,
-              //          яку поки не бачили відмінною від нуля
-              //   A[7] = стала константа (150500 у всіх відомих прикладах)
               if (prefix == "A" && fields.size() >= 6) {
-                float voltage = get_long(0) / 100.0f;
-                float current = get_long(1) / 1000.0f;
-                long minutes_remaining = get_long(3);
-                float ah_remaining = get_long(4) / 1000.0f;
-                float capacity_setting = get_long(5) / 10.0f;
-                float power = voltage * current;
+                float voltage     = get_long(0) / 100.0f;
+                float current_abs = get_long(1) / 1000.0f;
+                bool  charging    = (get_long(2) == 1);
+                long  mins        = get_long(3);
+                float ah_remain   = get_long(4) / 1000.0f;
+                float capacity    = get_long(5) / 10.0f;
+ 
+                // Sign: positive = charging, negative = discharging.
+                float signed_current = charging ? current_abs : -current_abs;
+                // Power = V * A, computed from raw integers to avoid float rounding.
+                // voltage(*0.01) * current(*0.001) = raw0*raw1 / 100000
+                float power = (get_long(0) * get_long(1)) / 100000.0f;
+                float signed_power = charging ? power : -power;
  
                 id(voltage_sensor).publish_state(voltage);
-                id(current_sensor).publish_state(current);
-                id(power_sensor).publish_state(power);
-                id(minutes_remaining_sensor).publish_state((float) minutes_remaining);
-                id(ah_remaining_sensor).publish_state(ah_remaining);
-                id(capacity_setting_sensor).publish_state(capacity_setting);
+                id(current_sensor).publish_state(signed_current);
+                id(power_sensor).publish_state(signed_power);
+                id(minutes_remaining_sensor).publish_state((float) mins);
+                id(ah_remaining_sensor).publish_state(ah_remain);
+                id(capacity_setting_sensor).publish_state(capacity);
+                id(charging_sensor).publish_state(charging);
+                id(status_sensor).publish_state(charging ? "Charging" : "Discharging");
  
-                if (capacity_setting > 0) {
-                  float soc = ah_remaining / capacity_setting * 100.0f;
+                // SoC = remaining / set capacity (ratio, not a raw % field).
+                if (capacity > 0) {
+                  float soc = (ah_remain / capacity) * 100.0f;
                   if (soc > 100) soc = 100;
-                  if (soc < 0) soc = 0;
+                  if (soc < 0)   soc = 0;
                   id(soc_sensor).publish_state(soc);
                 }
+ 
+              } else if (prefix == "C" && fields.size() >= 2) {
+                id(charge_kwh_sensor).publish_state(get_long(0) / 1000.0f);
+                id(discharge_kwh_sensor).publish_state(get_long(1) / 1000.0f);
               }
             }
           }
         } else {
           id(ble_buffer) += (char) b;
-          // запобіжник від переповнення, якщо щось пішло не так
-          if (id(ble_buffer).size() > 200) {
+          // Safety: discard oversized buffer (e.g. on corrupt data).
+          if (id(ble_buffer).size() > 200)
             id(ble_buffer).clear();
-          }
         }
       }
       return {};
@@ -216,7 +192,7 @@ sensor:
     update_interval: never
  
   - platform: template
-    name: "${friendly_name} Time charge/discharge"
+    name: "${friendly_name} Time Remaining"
     id: minutes_remaining_sensor
     unit_of_measurement: "min"
     icon: "mdi:timer-sand"
@@ -225,16 +201,35 @@ sensor:
     update_interval: never
  
   - platform: template
-    name: "${friendly_name} Capacity"
+    name: "${friendly_name} Set Capacity"
     id: capacity_setting_sensor
     unit_of_measurement: "Ah"
     state_class: measurement
     accuracy_decimals: 1
     icon: "mdi:battery-charging-100"
     update_interval: never
+    entity_category: diagnostic
  
   - platform: template
-    name: "${friendly_name} SoC"
+    name: "${friendly_name} Total Energy Charged"
+    id: charge_kwh_sensor
+    unit_of_measurement: "kWh"
+    device_class: energy
+    state_class: total_increasing
+    accuracy_decimals: 3
+    update_interval: never
+ 
+  - platform: template
+    name: "${friendly_name} Total Energy Discharged"
+    id: discharge_kwh_sensor
+    unit_of_measurement: "kWh"
+    device_class: energy
+    state_class: total_increasing
+    accuracy_decimals: 3
+    update_interval: never
+ 
+  - platform: template
+    name: "${friendly_name} State of Charge"
     id: soc_sensor
     unit_of_measurement: "%"
     device_class: battery
@@ -242,7 +237,6 @@ sensor:
     accuracy_decimals: 1
     update_interval: never
  
-  # RSSI BLE-з'єднання — корисно для діагностики дальності/стабільності
   - platform: ble_client
     type: rssi
     ble_client_id: km140f_ble
@@ -251,12 +245,25 @@ sensor:
  
 binary_sensor:
   - platform: template
-    name: "${friendly_name} Charging status"
-    id: charging_status
+    name: "${friendly_name} Charging"
+    id: charging_sensor
     device_class: battery_charging
+    internal: true
  
-# ПРИМІТКА: жодна команда запиту не потрібна — KM140F сам пасивно
-# (без запиту) шле через notify три типи рядків кожні кілька секунд:
-#   :A=... :B=... :C=...
-# Раніше тут була команда :R50= для KG/KH-серії, але KM140F використовує
-# інший, простіший протокол push-розсилки.
+text_sensor:
+  - platform: template
+    name: "${friendly_name} Status"
+    id: status_sensor
+    icon: "mdi:battery-arrow-up-outline"
+    update_interval: never
+ 
+# Request :C= (energy totals) every 30 s.
+# :A= is pushed by the device automatically — no request needed.
+interval:
+  - interval: 30s
+    then:
+      - ble_client.ble_write:
+          id: km140f_ble
+          service_uuid: "4fafc201-1fb5-459e-8fcc-c5c9c331914b"
+          characteristic_uuid: "beb5483e-36e1-4688-b7f5-ea07361b26a8"
+          value: [0x3A, 0x43, 0x0A]  # ":C\n"
